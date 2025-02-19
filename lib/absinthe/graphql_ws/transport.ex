@@ -181,8 +181,9 @@ defmodule Absinthe.GraphqlWS.Transport do
   def handle_subscribe(payload, id, socket) do
     with %{schema: schema} <- socket.absinthe,
          {:ok, variables} <- parse_variables(payload),
+         {:ok, extensions} <- parse_extensions(payload),
          {:ok, query} <- parse_query(payload) do
-      opts = socket.absinthe.opts |> Keyword.merge(variables: variables)
+      opts = socket.absinthe.opts |> Keyword.merge(variables: variables, extensions: extensions)
 
       Absinthe.Logger.log_run(:debug, {
         query,
@@ -207,6 +208,9 @@ defmodule Absinthe.GraphqlWS.Transport do
 
   defp parse_variables(%{"variables" => variables}) when is_map(variables), do: {:ok, variables}
   defp parse_variables(_), do: {:ok, %{}}
+
+  defp parse_extensions(%{"extensions" => extensions}) when is_map(extensions), do: {:ok, extensions}
+  defp parse_extensions(_), do: {:ok, %{}}
 
   def pipeline(schema, options) do
     schema
