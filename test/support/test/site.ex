@@ -14,11 +14,22 @@ defmodule Test.Site do
       Test.Site.TestPubSub.notify(:handle_message_callback, {:subscription, params})
       {:ok, socket}
     end
+
+    # Handle EXIT messages from completed tasks
+    def handle_message({:EXIT, _pid, :normal}, socket) do
+      {:ok, socket}
+    end
+
+    # Catch-all for any other messages
+    def handle_message(_msg, socket) do
+      {:ok, socket}
+    end
   end
 
   defmodule Resolvers do
     @thing_one %{id: 1, name: "one"}
     @thing_two %{id: 2, name: "two"}
+    @thing_slow %{id: 3, name: "slow"}
 
     def change_thing(_, %{id: 1, name: name}, _) do
       {:ok, %{id: 1, name: name}}
@@ -30,6 +41,12 @@ defmodule Test.Site do
 
     def get_thing(_, %{name: "one"}, _), do: {:ok, @thing_one}
     def get_thing(_, %{name: "two"}, _), do: {:ok, @thing_two}
+
+    def get_slow_thing(_, _, _) do
+      # Simulate a slow query that takes time to process
+      Process.sleep(500)
+      {:ok, @thing_slow}
+    end
 
     def handle_messages(_, _, _), do: {:ok, true}
 
@@ -59,6 +76,10 @@ defmodule Test.Site do
       field :thing, :thing do
         arg(:name, non_null(:string))
         resolve(&Resolvers.get_thing/3)
+      end
+
+      field :slow_thing, :thing do
+        resolve(&Resolvers.get_slow_thing/3)
       end
     end
 
@@ -115,10 +136,11 @@ defmodule Test.Site do
       Supervisor.start_link(children, opts)
     end
 
-    defp pubsub_name,
-      do:
-        Application.get_env(:absinthe_graphql_ws, Test.Site.Endpoint)
-        |> Keyword.fetch!(:pubsub_server)
+    defp pubsub_name do
+      :absinthe_graphql_ws
+      |> Elixir.Application.get_env(Test.Site.Endpoint)
+      |> Keyword.fetch!(:pubsub_server)
+    end
   end
 
   defmodule Web do

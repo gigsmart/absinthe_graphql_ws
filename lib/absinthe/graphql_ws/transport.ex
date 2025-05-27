@@ -24,7 +24,7 @@ defmodule Absinthe.GraphqlWS.Transport do
   @type socket() :: Socket.t()
 
   defmacrop debug(msg), do: quote(do: Logger.debug("[graph-socket@#{inspect(self())}] #{unquote(msg)}"))
-  defmacrop warn(msg), do: quote(do: Logger.warn("[graph-socket@#{inspect(self())}] #{unquote(msg)}"))
+  defmacrop warn(msg), do: quote(do: Logger.warning("[graph-socket@#{inspect(self())}] #{unquote(msg)}", []))
 
   @doc """
   Generally this will only receive `:pong` messages in response to our keepalive
@@ -37,7 +37,7 @@ defmodule Absinthe.GraphqlWS.Transport do
   def handle_control({_, opcode: :pong}, socket), do: {:ok, socket}
 
   def handle_control(message, state) do
-    warn(" unhandled control frame #{inspect(message)}")
+    warn("unhandled control frame #{inspect(message)}")
     {:ok, state}
   end
 
@@ -86,6 +86,45 @@ defmodule Absinthe.GraphqlWS.Transport do
   def handle_info(%Broadcast{event: "subscription:data", payload: payload, topic: topic}, socket) do
     subscription_id = socket.subscriptions[topic]
     {:push, {:text, Message.Next.new(subscription_id, payload.result)}, socket}
+  end
+
+  # Handle query/mutation operations results from PubSub
+  def handle_info(%Broadcast{event: "query:data", payload: payload}, socket) do
+    %{id: id, result: result, context: context, topic: topic} = payload
+    
+    # Unsubscribe from the query topic to prevent memory leaks
+    Phoenix.PubSub.unsubscribe(socket.pubsub, topic)
+    
+    case result do
+      %{data: _} = reply ->
+        queue_complete_message(id)
+        socket = merge_opts(socket, context: context)
+        {:push, {:text, Message.Next.new(id, reply)}, socket}
+
+      %{errors: errors} ->
+        socket = merge_opts(socket, context: context)
+        {:push, {:text, Message.Error.new(id, errors)}, socket}
+    end
+  end
+
+  # Handle query/mutation errors from PubSub
+  def handle_info(%Broadcast{event: "query:error", payload: payload}, socket) do
+    %{id: id, error: error, topic: topic} = payload
+    
+    # Unsubscribe from the query topic to prevent memory leaks
+    Phoenix.PubSub.unsubscribe(socket.pubsub, topic)
+    
+    {:push, {:text, Message.Error.new(id, error)}, socket}
+  end
+  
+  # Handle query/mutation timeouts
+  def handle_info(%Broadcast{event: "query:timeout", payload: payload}, socket) do
+    %{id: id, topic: topic} = payload
+    
+    # Unsubscribe from the query topic to prevent memory leaks
+    Phoenix.PubSub.unsubscribe(socket.pubsub, topic)
+    
+    {:push, {:text, Message.Error.new(id, "Query execution timed out")}, socket}
   end
 
   def handle_info({:complete, id}, socket) do
@@ -214,6 +253,16 @@ defmodule Absinthe.GraphqlWS.Transport do
   end
 
   defp run_doc(socket, id, query, config, opts) do
+    case determine_operation_type(query) do
+      :subscription ->
+        handle_subscription(socket, id, query, config, opts)
+      _ ->
+        handle_query_or_mutation(socket, id, query, config, opts)
+    end
+  end
+
+  # Handle subscription operations
+  defp handle_subscription(socket, id, query, config, opts) do
     case run(query, config[:schema], config[:pipeline], opts) do
       {:ok, %{"subscribed" => topic}, context} ->
         debug("subscribed to topic #{topic}")
@@ -240,6 +289,151 @@ defmodule Absinthe.GraphqlWS.Transport do
 
       {:error, reply} ->
         {:reply, :error, {:text, Message.Error.new(id, reply)}, socket}
+    end
+  end
+
+  # Handle query or mutation operations using Task.Supervisor for non-blocking execution
+  defp handle_query_or_mutation(socket, id, query, config, opts) do
+    # Create a unique topic for this query
+    query_topic = "graphql_ws:query:#{id}"
+    
+    # Subscribe to the query topic
+    :ok = Phoenix.PubSub.subscribe(socket.pubsub, query_topic)
+    
+    # Get the query execution timeout from config (default: 30 seconds)
+    timeout = Application.get_env(:absinthe_graphql_ws, :query_timeout, 30_000)
+    
+    # Use the Task.Supervisor to run the query with proper supervision
+    task_supervisor_name = get_task_supervisor()
+    
+    # Execute task on a potentially remote node to distribute work across the cluster
+    node = choose_execution_node()
+    
+    # Start a supervised task to execute the query on the selected node
+    task_supervisor = Module.concat(task_supervisor_name, TaskSupervisor)
+    Task.Supervisor.async_nolink(
+      {task_supervisor, node},
+      fn ->
+        try do
+          # Execute the query with a timeout
+          case run(query, config[:schema], config[:pipeline], opts) do
+            {:ok, result, context} ->
+              # Publish the result back to the socket process
+              Phoenix.PubSub.broadcast(
+                socket.pubsub,
+                query_topic,
+                %Broadcast{
+                  event: "query:data",
+                  payload: %{id: id, result: result, context: context, topic: query_topic}
+                }
+              )
+            
+            {:error, error} ->
+              # Publish the error back to the socket process
+              Phoenix.PubSub.broadcast(
+                socket.pubsub,
+                query_topic,
+                %Broadcast{
+                  event: "query:error",
+                  payload: %{id: id, error: error, topic: query_topic}
+                }
+              )
+          end
+        rescue
+          e ->
+            # Handle exceptions during query execution
+            Phoenix.PubSub.broadcast(
+              socket.pubsub,
+              query_topic,
+              %Broadcast{
+                event: "query:error",
+                payload: %{id: id, error: Exception.message(e), topic: query_topic}
+              }
+            )
+        catch
+          :exit, reason ->
+            # Handle task exit
+            Phoenix.PubSub.broadcast(
+              socket.pubsub,
+              query_topic,
+              %Broadcast{
+                event: "query:error",
+                payload: %{id: id, error: "Operation failed: #{inspect(reason)}", topic: query_topic}
+              }
+            )
+        end
+      end,
+      timeout: timeout
+    )
+    |> monitor_task(id, query_topic, socket.pubsub, timeout)
+
+    # Return immediately, allowing other operations to be processed
+    {:ok, socket}
+  end
+  
+  # Monitor the task and handle timeouts
+  defp monitor_task(task, id, topic, pubsub, timeout) do
+    # Spawn a monitoring process that will handle the timeout
+    spawn(fn ->
+      # Set up a timer for the timeout
+      timer_ref = Process.send_after(self(), :timeout, timeout)
+      
+      # Wait for the task to complete or timeout
+      receive do
+        {ref, _result} when ref == task.ref ->
+          # Task completed successfully, cancel the timer
+          Process.cancel_timer(timer_ref)
+        
+        :timeout ->
+          # Task timed out, notify the socket process
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            %Broadcast{
+              event: "query:timeout",
+              payload: %{id: id, topic: topic}
+            }
+          )
+          
+          # Cancel the task if it's still running
+          Task.shutdown(task, :brutal_kill)
+      end
+    end)
+  end
+  
+  # Get the task supervisor, creating it if necessary
+  defp get_task_supervisor do
+    supervisor_name = Absinthe.GraphqlWS.QuerySupervisor
+    
+    # Ensure the supervisor is started
+    case Process.whereis(supervisor_name) do
+      nil ->
+        # Supervisor doesn't exist, start it
+        {:ok, _pid} = Absinthe.GraphqlWS.QuerySupervisor.start_link()
+        supervisor_name
+      _pid ->
+        supervisor_name
+    end
+  end
+  
+  # Choose a node to execute the query on for load balancing
+  defp choose_execution_node do
+    # Get all connected nodes, including the local node
+    nodes = [node() | Node.list()]
+    
+    # Select a random node from the cluster for basic load distribution
+    # In a production system, you might want more sophisticated node selection
+    # based on current load, locality, etc.
+    Enum.random(nodes)
+  end
+
+  # New function to determine operation type from the query
+  defp determine_operation_type(query) do
+    # Simple pattern matching for operation type
+    if String.match?(query, ~r/subscription\s*{/i) or String.match?(query, ~r/subscription\s+\w+/i) do
+      :subscription
+    else
+      :query_or_mutation
     end
   end
 
