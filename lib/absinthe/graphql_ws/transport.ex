@@ -117,15 +117,6 @@ defmodule Absinthe.GraphqlWS.Transport do
     {:push, {:text, Message.Error.new(id, error)}, socket}
   end
   
-  # Handle query/mutation timeouts
-  def handle_info(%Broadcast{event: "query:timeout", payload: payload}, socket) do
-    %{id: id, topic: topic} = payload
-    
-    # Unsubscribe from the query topic to prevent memory leaks
-    Phoenix.PubSub.unsubscribe(socket.pubsub, topic)
-    
-    {:push, {:text, Message.Error.new(id, "Query execution timed out")}, socket}
-  end
 
   def handle_info({:complete, id}, socket) do
     {:push, {:text, Message.Complete.new(id)}, socket}
@@ -296,7 +287,7 @@ defmodule Absinthe.GraphqlWS.Transport do
     end
   end
 
-  # Handle query or mutation operations using Task.Supervisor for non-blocking execution
+  # Handle query or mutation operations asynchronously for non-blocking execution
   defp handle_query_or_mutation(socket, id, query, config, opts) do
     # Create a unique topic for this query
     query_topic = "graphql_ws:query:#{id}"
@@ -304,131 +295,72 @@ defmodule Absinthe.GraphqlWS.Transport do
     # Subscribe to the query topic
     :ok = Phoenix.PubSub.subscribe(socket.pubsub, query_topic)
     
-    # Get the query execution timeout from config (default: 30 seconds)
-    timeout = Application.get_env(:absinthe_graphql_ws, :query_timeout, 30_000)
+    # Start an async task to execute the query
+    # Use OpentelemetryProcessPropagator.Task if available for proper tracing context propagation
+    task_module = get_task_module()
     
-    # Use the Task.Supervisor to run the query with proper supervision
-    task_supervisor_name = get_task_supervisor()
-    
-    # Execute task on a potentially remote node to distribute work across the cluster
-    node = choose_execution_node()
-    
-    # Start a supervised task to execute the query on the selected node
-    task_supervisor = Module.concat(task_supervisor_name, TaskSupervisor)
-    Task.Supervisor.async_nolink(
-      {task_supervisor, node},
-      fn ->
-        try do
-          # Execute the query with a timeout
-          case run(query, config[:schema], config[:pipeline], opts) do
-            {:ok, result, context} ->
-              # Publish the result back to the socket process
-              Phoenix.PubSub.broadcast(
-                socket.pubsub,
-                query_topic,
-                %Broadcast{
-                  event: "query:data",
-                  payload: %{id: id, result: result, context: context, topic: query_topic}
-                }
-              )
-            
-            {:error, error} ->
-              # Publish the error back to the socket process
-              Phoenix.PubSub.broadcast(
-                socket.pubsub,
-                query_topic,
-                %Broadcast{
-                  event: "query:error",
-                  payload: %{id: id, error: error, topic: query_topic}
-                }
-              )
-          end
-        rescue
-          e ->
-            # Handle exceptions during query execution
+    task_module.async(fn ->
+      try do
+        # Execute the query
+        case run(query, config[:schema], config[:pipeline], opts) do
+          {:ok, result, context} ->
+            # Publish the result back to the socket process
             Phoenix.PubSub.broadcast(
               socket.pubsub,
               query_topic,
               %Broadcast{
-                event: "query:error",
-                payload: %{id: id, error: Exception.message(e), topic: query_topic}
+                event: "query:data",
+                payload: %{id: id, result: result, context: context, topic: query_topic}
               }
             )
-        catch
-          :exit, reason ->
-            # Handle task exit
+          
+          {:error, error} ->
+            # Publish the error back to the socket process
             Phoenix.PubSub.broadcast(
               socket.pubsub,
               query_topic,
               %Broadcast{
                 event: "query:error",
-                payload: %{id: id, error: "Operation failed: #{inspect(reason)}", topic: query_topic}
+                payload: %{id: id, error: error, topic: query_topic}
               }
             )
         end
-      end,
-      timeout: timeout
-    )
-    |> monitor_task(id, query_topic, socket.pubsub, timeout)
+      rescue
+        e ->
+          # Handle exceptions during query execution
+          Phoenix.PubSub.broadcast(
+            socket.pubsub,
+            query_topic,
+            %Broadcast{
+              event: "query:error",
+              payload: %{id: id, error: Exception.message(e), topic: query_topic}
+            }
+          )
+      catch
+        :exit, reason ->
+          # Handle task exit
+          Phoenix.PubSub.broadcast(
+            socket.pubsub,
+            query_topic,
+            %Broadcast{
+              event: "query:error",
+              payload: %{id: id, error: "Operation failed: #{inspect(reason)}", topic: query_topic}
+            }
+          )
+      end
+    end)
 
     # Return immediately, allowing other operations to be processed
     {:ok, socket}
   end
   
-  # Monitor the task and handle timeouts
-  defp monitor_task(task, id, topic, pubsub, timeout) do
-    # Spawn a monitoring process that will handle the timeout
-    spawn(fn ->
-      # Set up a timer for the timeout
-      timer_ref = Process.send_after(self(), :timeout, timeout)
-      
-      # Wait for the task to complete or timeout
-      receive do
-        {ref, _result} when ref == task.ref ->
-          # Task completed successfully, cancel the timer
-          Process.cancel_timer(timer_ref)
-        
-        :timeout ->
-          # Task timed out, notify the socket process
-          Phoenix.PubSub.broadcast(
-            pubsub,
-            topic,
-            %Broadcast{
-              event: "query:timeout",
-              payload: %{id: id, topic: topic}
-            }
-          )
-          
-          # Cancel the task if it's still running
-          Task.shutdown(task, :brutal_kill)
-      end
-    end)
-  end
-  
-  # Get the task supervisor, creating it if necessary
-  defp get_task_supervisor do
-    supervisor_name = Absinthe.GraphqlWS.QuerySupervisor
-    
-    # Ensure the supervisor is started
-    case Process.whereis(supervisor_name) do
-      nil ->
-        # Supervisor doesn't exist, start it
-        {:ok, _pid} = Absinthe.GraphqlWS.QuerySupervisor.start_link()
-        supervisor_name
-      _pid ->
-        supervisor_name
+  # Get the appropriate Task module, preferring OpentelemetryProcessPropagator.Task if available
+  defp get_task_module do
+    if Code.ensure_loaded?(OpentelemetryProcessPropagator.Task) do
+      OpentelemetryProcessPropagator.Task
+    else
+      Task
     end
-  end
-  
-  # Choose a node to execute the query on for load balancing
-  defp choose_execution_node do
-    # Get all connected nodes, including the local node
-    nodes = [node() | Node.list()]
-    
-    # Select a random node from the cluster for basic load distribution
-    # In a production system, you might want more sophisticated node selection
-    # based on current load, locality, etc.
-    Enum.random(nodes)
   end
 
   # New function to determine operation type from the query
