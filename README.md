@@ -108,6 +108,67 @@ An example of handle_info
   end
 ```
 
+## Incremental Delivery
+
+AbsintheGraphqlWS supports GraphQL `@defer` and `@stream` directives for incremental delivery over WebSocket connections using the GraphQL-WS protocol. This enables real-time streaming of deferred fragments and list items while maintaining protocol compliance.
+
+Key features:
+- ✅ **GraphQL-WS Protocol**: Full compliance with GraphQL-WS specification
+- ✅ **Bidirectional Streaming**: Supports both client subscriptions and server-initiated streaming  
+- ✅ **Message Sequencing**: Proper ordering of initial, incremental, and completion messages
+- ✅ **Error Handling**: Graceful error recovery and connection management
+
+**Installation with incremental delivery:**
+
+```elixir
+def deps do
+  [
+    {:absinthe, git: "https://github.com/gigsmart/absinthe.git", branch: "gigmart/defer-stream-incremental"},
+    {:absinthe_graphql_ws, git: "https://github.com/gigsmart/absinthe_graphql_ws.git", branch: "gigmart/defer-stream-incremental"}
+  ]
+end
+```
+
+**Example usage:**
+
+```javascript
+// Client-side WebSocket connection
+import { createClient } from 'graphql-ws';
+
+const client = createClient({
+  url: 'ws://localhost:4000/graphql/websocket'
+});
+
+const unsubscribe = client.subscribe(
+  {
+    query: `
+      query GetUserProfile($userId: ID!) {
+        user(id: $userId) {
+          id
+          name
+          ... @defer(label: "profile") {
+            email
+            profile { bio }
+          }
+          posts @stream(initialCount: 2, label: "posts") {
+            id
+            title
+          }
+        }
+      }
+    `,
+    variables: { userId: "123" }
+  },
+  {
+    next: (data) => console.log('Received data:', data),
+    error: (error) => console.error('GraphQL error:', error),
+    complete: () => console.log('Query completed')
+  }
+);
+```
+
+For comprehensive documentation on WebSocket incremental delivery patterns, see [Absinthe Incremental Delivery Guide](https://hexdocs.pm/absinthe/incremental-delivery.html).
+
 ## Benchmarks
 
 Benchmarks live in the `benchmarks` directory, and can be run with `MIX_ENV=bench mix run
