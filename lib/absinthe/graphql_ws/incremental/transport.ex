@@ -9,7 +9,6 @@ defmodule Absinthe.GraphqlWS.Incremental.Transport do
   use Absinthe.Incremental.Transport
   
   alias Absinthe.GraphqlWS.Message
-  alias Absinthe.Incremental.Response
   
   require Logger
   
