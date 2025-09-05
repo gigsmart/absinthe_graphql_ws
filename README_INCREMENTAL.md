@@ -21,8 +21,8 @@ This functionality is included in the main `absinthe_graphql_ws` package when us
 ```elixir
 def deps do
   [
-    {:absinthe, "~> 1.8"},
-    {:absinthe_graphql_ws, "~> 0.3"}
+    {:absinthe, git: "https://github.com/gigsmart/absinthe.git", branch: "gigmart/defer-stream-incremental"},
+    {:absinthe_graphql_ws, git: "https://github.com/gigsmart/absinthe_graphql_ws.git", branch: "gigmart/defer-stream-incremental"}
   ]
 end
 ```
