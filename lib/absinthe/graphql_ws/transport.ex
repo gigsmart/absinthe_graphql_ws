@@ -91,10 +91,10 @@ defmodule Absinthe.GraphqlWS.Transport do
   # Handle query/mutation operations results from PubSub
   def handle_info(%Broadcast{event: "query:data", payload: payload}, socket) do
     %{id: id, result: result, context: context, topic: topic} = payload
-    
+
     # Unsubscribe from the query topic to prevent memory leaks
     Phoenix.PubSub.unsubscribe(socket.pubsub, topic)
-    
+
     case result do
       %{data: _} = reply ->
         queue_complete_message(id)
@@ -110,13 +110,12 @@ defmodule Absinthe.GraphqlWS.Transport do
   # Handle query/mutation errors from PubSub
   def handle_info(%Broadcast{event: "query:error", payload: payload}, socket) do
     %{id: id, error: error, topic: topic} = payload
-    
+
     # Unsubscribe from the query topic to prevent memory leaks
     Phoenix.PubSub.unsubscribe(socket.pubsub, topic)
-    
+
     {:push, {:text, Message.Error.new(id, error)}, socket}
   end
-  
 
   def handle_info({:complete, id}, socket) do
     {:push, {:text, Message.Complete.new(id)}, socket}
@@ -212,7 +211,8 @@ defmodule Absinthe.GraphqlWS.Transport do
     with %{schema: schema} <- socket.absinthe,
          {:ok, variables} <- parse_variables(payload),
          {:ok, extensions} <- parse_extensions(payload),
-         {:ok, query} <- parse_query(payload) do
+         {:ok, query} <- parse_query(payload),
+         {:ok, operation_name} <- parse_operation_name(payload) do
       opts = socket.absinthe.opts |> Keyword.merge(variables: variables, extensions: extensions)
 
       Absinthe.Logger.log_run(:debug, {
@@ -222,7 +222,7 @@ defmodule Absinthe.GraphqlWS.Transport do
         opts
       })
 
-      run_doc(socket, id, query, socket.absinthe, opts)
+      run_doc(socket, id, query, operation_name, socket.absinthe, opts)
     else
       _ ->
         {:ok, socket}
@@ -232,6 +232,9 @@ defmodule Absinthe.GraphqlWS.Transport do
   defp close(code, message, socket) do
     {:reply, :ok, {:close, code, message}, socket}
   end
+
+  defp parse_operation_name(%{"operationName" => operation_name}) when is_binary(operation_name), do: {:ok, operation_name}
+  defp parse_operation_name(_), do: {:ok, ""}
 
   defp parse_query(%{"query" => query}) when is_binary(query), do: {:ok, query}
   defp parse_query(_), do: {:ok, ""}
@@ -247,10 +250,11 @@ defmodule Absinthe.GraphqlWS.Transport do
     |> Absinthe.Pipeline.for_document(options)
   end
 
-  defp run_doc(socket, id, query, config, opts) do
-    case determine_operation_type(query) do
+  defp run_doc(socket, id, query, operation_name, config, opts) do
+    case determine_operation_type(query, operation_name) do
       :subscription ->
         handle_subscription(socket, id, query, config, opts)
+
       _ ->
         handle_query_or_mutation(socket, id, query, config, opts)
     end
@@ -291,14 +295,14 @@ defmodule Absinthe.GraphqlWS.Transport do
   defp handle_query_or_mutation(socket, id, query, config, opts) do
     # Create a unique topic for this query
     query_topic = "graphql_ws:query:#{id}"
-    
+
     # Subscribe to the query topic
     :ok = Phoenix.PubSub.subscribe(socket.pubsub, query_topic)
-    
+
     # Start an async task to execute the query
     # Use OpentelemetryProcessPropagator.Task if available for proper tracing context propagation
     task_module = get_task_module()
-    
+
     task_module.async(fn ->
       try do
         # Execute the query
@@ -313,7 +317,7 @@ defmodule Absinthe.GraphqlWS.Transport do
                 payload: %{id: id, result: result, context: context, topic: query_topic}
               }
             )
-          
+
           {:error, error} ->
             # Publish the error back to the socket process
             Phoenix.PubSub.broadcast(
@@ -353,7 +357,7 @@ defmodule Absinthe.GraphqlWS.Transport do
     # Return immediately, allowing other operations to be processed
     {:ok, socket}
   end
-  
+
   # Get the appropriate Task module, preferring OpentelemetryProcessPropagator.Task if available
   defp get_task_module do
     if Code.ensure_loaded?(OpentelemetryProcessPropagator.Task) do
@@ -364,9 +368,10 @@ defmodule Absinthe.GraphqlWS.Transport do
   end
 
   # New function to determine operation type from the query
-  defp determine_operation_type(query) do
+  defp determine_operation_type(query, operation_name) do
     # Simple pattern matching for operation type
-    if String.match?(query, ~r/subscription\s*{/i) or String.match?(query, ~r/subscription\s+\w+/i) do
+    if String.match?(operation_name, ~r/subscription$/i) or String.match?(query, ~r/subscription\s*{/i) or
+         String.match?(query, ~r/subscription\s+\w+/i) do
       :subscription
     else
       :query_or_mutation
