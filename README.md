@@ -115,5 +115,5 @@ benchmarks/<file>`.
 
 ## Contributing
 
-- Pull requests that may be rebased are preferrable to merges or squashes.
+- Pull requests that may be rebased are preferable to merges or squashes.
 - Please **do not** increment the version number in pull requests.
