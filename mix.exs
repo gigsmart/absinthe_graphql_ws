@@ -29,7 +29,7 @@ defmodule AbsintheGraphqlWS.MixProject do
 
   defp deps do
     [
-      {:absinthe, git: "https://github.com/gigsmart/absinthe.git", branch: "gigmart/defer-stream-incremental", override: true},
+      {:absinthe, git: "https://github.com/gigsmart/absinthe.git", branch: "main", override: true},
       {:absinthe_phoenix, "~> 2.0"},
       {:benchee, "> 0.0.0", only: [:bench]},
       {:credo, "~> 1.4", only: [:dev, :test], runtime: false},
